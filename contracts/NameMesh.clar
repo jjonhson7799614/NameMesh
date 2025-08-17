@@ -19,6 +19,12 @@
 (define-constant ERR_AUCTION_ACTIVE (err u110))
 (define-constant ERR_NOT_AUCTION_WINNER (err u111))
 (define-constant ERR_AUCTION_NOT_ENDED (err u112))
+(define-constant ERR_SUBDOMAIN_EXISTS (err u113))
+(define-constant ERR_INVALID_SUBDOMAIN (err u114))
+(define-constant ERR_NOT_PARENT_OWNER (err u115))
+(define-constant ERR_SUBDOMAIN_NOT_FOUND (err u116))
+(define-constant ERR_NOT_SUBDOMAIN_OWNER (err u117))
+(define-constant ERR_PARENT_NAME_EXPIRED (err u118))
 
 (define-constant MIN_NAME_LENGTH u3)
 (define-constant MAX_NAME_LENGTH u64)
@@ -28,8 +34,12 @@
 (define-constant AUCTION_DURATION u1440)
 (define-constant MIN_BID_INCREMENT u100000)
 (define-constant AUCTION_GRACE_PERIOD u144)
+(define-constant DEFAULT_SUBDOMAIN_COST u250000)
+(define-constant MAX_SUBDOMAIN_LENGTH u32)
+(define-constant SUBDOMAIN_REVENUE_SHARE u70)
 
 (define-data-var total-names-registered uint u0)
+(define-data-var total-subdomains-created uint u0)
 (define-data-var contract-balance uint u0)
 
 (define-map name-registry
@@ -87,6 +97,39 @@
   { active-bids: (list 20 (string-ascii 64)) }
 )
 
+(define-map subdomain-registry
+  { parent-name: (string-ascii 64), subdomain: (string-ascii 32) }
+  {
+    owner: principal,
+    delegated-to: principal,
+    resolver: (string-ascii 256),
+    created-at: uint,
+    cost: uint,
+    revenue-share: uint
+  }
+)
+
+(define-map parent-subdomain-settings
+  { parent-name: (string-ascii 64) }
+  {
+    subdomain-cost: uint,
+    revenue-share: uint,
+    max-subdomains: uint,
+    current-subdomains: uint,
+    allow-delegation: bool
+  }
+)
+
+(define-map user-subdomains
+  { user: principal }
+  { subdomains: (list 30 {parent: (string-ascii 64), sub: (string-ascii 32)}) }
+)
+
+(define-map subdomain-records
+  { parent-name: (string-ascii 64), subdomain: (string-ascii 32), record-type: (string-ascii 16) }
+  { value: (string-ascii 256) }
+)
+
 (define-private (is-valid-name (name (string-ascii 64)))
   (let ((name-len (len name)))
     (and 
@@ -122,6 +165,26 @@
     (map-set user-auction-bids 
       { user: user }
       { active-bids: (unwrap-panic (as-max-len? (append current-bids name) u20)) }
+    )
+  )
+)
+
+(define-private (is-valid-subdomain (subdomain (string-ascii 32)))
+  (let ((subdomain-len (len subdomain)))
+    (and 
+      (>= subdomain-len u1)
+      (<= subdomain-len MAX_SUBDOMAIN_LENGTH)
+      (is-eq (index-of subdomain " ") none)
+      (is-eq (index-of subdomain ".") none)
+    )
+  )
+)
+
+(define-private (add-subdomain-to-user (user principal) (parent-name (string-ascii 64)) (subdomain (string-ascii 32)))
+  (let ((current-subdomains (default-to (list) (get subdomains (map-get? user-subdomains { user: user })))))
+    (map-set user-subdomains 
+      { user: user }
+      { subdomains: (unwrap-panic (as-max-len? (append current-subdomains {parent: parent-name, sub: subdomain}) u30)) }
     )
   )
 )
@@ -358,6 +421,118 @@
   )
 )
 
+(define-public (configure-subdomain-settings (parent-name (string-ascii 64)) (subdomain-cost uint) (revenue-share uint) (max-subdomains uint) (allow-delegation bool))
+  (let ((name-data (unwrap! (map-get? name-registry { name: parent-name }) ERR_NAME_NOT_FOUND)))
+    (asserts! (is-eq (get owner name-data) tx-sender) ERR_NOT_PARENT_OWNER)
+    (asserts! (> (get expires-at name-data) stacks-block-height) ERR_PARENT_NAME_EXPIRED)
+    (asserts! (<= revenue-share u100) ERR_INVALID_SUBDOMAIN)
+    
+    (map-set parent-subdomain-settings
+      { parent-name: parent-name }
+      {
+        subdomain-cost: subdomain-cost,
+        revenue-share: revenue-share,
+        max-subdomains: max-subdomains,
+        current-subdomains: u0,
+        allow-delegation: allow-delegation
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (create-subdomain (parent-name (string-ascii 64)) (subdomain (string-ascii 32)) (resolver (string-ascii 256)))
+  (let (
+    (name-data (unwrap! (map-get? name-registry { name: parent-name }) ERR_NAME_NOT_FOUND))
+    (settings (unwrap! (map-get? parent-subdomain-settings { parent-name: parent-name }) ERR_INVALID_SUBDOMAIN))
+    (subdomain-cost (get subdomain-cost settings))
+    (payment-amount (stx-get-balance tx-sender))
+  )
+    (asserts! (is-valid-subdomain subdomain) ERR_INVALID_SUBDOMAIN)
+    (asserts! (> (get expires-at name-data) stacks-block-height) ERR_PARENT_NAME_EXPIRED)
+    (asserts! (is-none (map-get? subdomain-registry { parent-name: parent-name, subdomain: subdomain })) ERR_SUBDOMAIN_EXISTS)
+    (asserts! (< (get current-subdomains settings) (get max-subdomains settings)) ERR_INVALID_SUBDOMAIN)
+    (asserts! (>= payment-amount subdomain-cost) ERR_INSUFFICIENT_PAYMENT)
+    
+    (try! (stx-transfer? subdomain-cost tx-sender (as-contract tx-sender)))
+    
+    (let (
+      (parent-owner-share (/ (* subdomain-cost (get revenue-share settings)) u100))
+      (contract-share (- subdomain-cost parent-owner-share))
+    )
+      (if (> parent-owner-share u0)
+        (try! (as-contract (stx-transfer? parent-owner-share tx-sender (get owner name-data))))
+        true
+      )
+      
+      (map-set subdomain-registry
+        { parent-name: parent-name, subdomain: subdomain }
+        {
+          owner: (get owner name-data),
+          delegated-to: tx-sender,
+          resolver: resolver,
+          created-at: stacks-block-height,
+          cost: subdomain-cost,
+          revenue-share: (get revenue-share settings)
+        }
+      )
+      
+      (map-set parent-subdomain-settings
+        { parent-name: parent-name }
+        (merge settings { current-subdomains: (+ (get current-subdomains settings) u1) })
+      )
+      
+      (add-subdomain-to-user tx-sender parent-name subdomain)
+      (var-set total-subdomains-created (+ (var-get total-subdomains-created) u1))
+      (var-set contract-balance (+ (var-get contract-balance) contract-share))
+      
+      (ok true)
+    )
+  )
+)
+
+(define-public (transfer-subdomain (parent-name (string-ascii 64)) (subdomain (string-ascii 32)) (new-delegated principal))
+  (let ((subdomain-data (unwrap! (map-get? subdomain-registry { parent-name: parent-name, subdomain: subdomain }) ERR_SUBDOMAIN_NOT_FOUND)))
+    (asserts! (is-eq (get delegated-to subdomain-data) tx-sender) ERR_NOT_SUBDOMAIN_OWNER)
+    
+    (map-set subdomain-registry
+      { parent-name: parent-name, subdomain: subdomain }
+      (merge subdomain-data { delegated-to: new-delegated })
+    )
+    
+    (add-subdomain-to-user new-delegated parent-name subdomain)
+    
+    (ok true)
+  )
+)
+
+(define-public (set-subdomain-record (parent-name (string-ascii 64)) (subdomain (string-ascii 32)) (record-type (string-ascii 16)) (value (string-ascii 256)))
+  (let ((subdomain-data (unwrap! (map-get? subdomain-registry { parent-name: parent-name, subdomain: subdomain }) ERR_SUBDOMAIN_NOT_FOUND)))
+    (asserts! (is-eq (get delegated-to subdomain-data) tx-sender) ERR_NOT_SUBDOMAIN_OWNER)
+    
+    (map-set subdomain-records
+      { parent-name: parent-name, subdomain: subdomain, record-type: record-type }
+      { value: value }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (update-subdomain-resolver (parent-name (string-ascii 64)) (subdomain (string-ascii 32)) (new-resolver (string-ascii 256)))
+  (let ((subdomain-data (unwrap! (map-get? subdomain-registry { parent-name: parent-name, subdomain: subdomain }) ERR_SUBDOMAIN_NOT_FOUND)))
+    (asserts! (is-eq (get delegated-to subdomain-data) tx-sender) ERR_NOT_SUBDOMAIN_OWNER)
+    
+    (map-set subdomain-registry
+      { parent-name: parent-name, subdomain: subdomain }
+      (merge subdomain-data { resolver: new-resolver })
+    )
+    
+    (ok true)
+  )
+)
+
 (define-public (withdraw-funds (amount uint))
   (begin
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
@@ -461,3 +636,46 @@
     none
   )
 )
+
+(define-read-only (get-subdomain-info (parent-name (string-ascii 64)) (subdomain (string-ascii 32)))
+  (map-get? subdomain-registry { parent-name: parent-name, subdomain: subdomain })
+)
+
+(define-read-only (get-parent-subdomain-settings (parent-name (string-ascii 64)))
+  (map-get? parent-subdomain-settings { parent-name: parent-name })
+)
+
+(define-read-only (get-user-subdomains (user principal))
+  (map-get? user-subdomains { user: user })
+)
+
+(define-read-only (get-subdomain-record (parent-name (string-ascii 64)) (subdomain (string-ascii 32)) (record-type (string-ascii 16)))
+  (map-get? subdomain-records { parent-name: parent-name, subdomain: subdomain, record-type: record-type })
+)
+
+(define-read-only (get-total-subdomains)
+  (var-get total-subdomains-created)
+)
+
+(define-read-only (is-subdomain-available (parent-name (string-ascii 64)) (subdomain (string-ascii 32)))
+  (is-none (map-get? subdomain-registry { parent-name: parent-name, subdomain: subdomain }))
+)
+
+(define-read-only (get-subdomain-owner (parent-name (string-ascii 64)) (subdomain (string-ascii 32)))
+  (match (map-get? subdomain-registry { parent-name: parent-name, subdomain: subdomain })
+    some-data (some (get delegated-to some-data))
+    none
+  )
+)
+
+(define-read-only (get-subdomain-cost-for-parent (parent-name (string-ascii 64)))
+  (match (map-get? parent-subdomain-settings { parent-name: parent-name })
+    some-settings (some (get subdomain-cost some-settings))
+    (some DEFAULT_SUBDOMAIN_COST)
+  )
+)
+
+
+
+
+
