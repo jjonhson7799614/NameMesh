@@ -233,6 +233,7 @@
     (var-set total-names-registered (+ (var-get total-names-registered) u1))
     (var-set contract-balance (+ (var-get contract-balance) REGISTRATION_COST))
     
+    (unwrap-panic (initialize-name-reputation name))
     (ok true)
   )
 )
@@ -255,6 +256,7 @@
     (record-name-history name tx-sender tx-sender "renew")
     (var-set contract-balance (+ (var-get contract-balance) RENEWAL_COST))
     
+    (unwrap-panic (record-reputation-activity name "renewal"))
     (ok true)
   )
 )
@@ -673,6 +675,18 @@
     some-settings (some (get subdomain-cost some-settings))
     (some DEFAULT_SUBDOMAIN_COST)
   )
+)
+
+;; Reputation tracking helper functions
+;; Note: These would integrate with reputation contract after deployment
+(define-private (initialize-name-reputation (name (string-ascii 64)))
+  ;; (contract-call? .namemesh-reputation initialize-reputation name)
+  (ok true)
+)
+
+(define-private (record-reputation-activity (name (string-ascii 64)) (activity-type (string-ascii 20)))
+  ;; (contract-call? .namemesh-reputation record-activity name activity-type)
+  (ok true)
 )
 
 

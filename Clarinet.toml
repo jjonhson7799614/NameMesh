@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/NameMesh.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.namemesh-reputation]
+path = 'contracts/namemesh-reputation.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
